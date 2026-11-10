@@ -154,7 +154,7 @@ class Polynomial(FunctionSpace):
 
     @property
     def reference_domain(self) -> Domain:
-        raise NotImplementedError
+        return (-1, 1)
 
     @overload
     def basis_function(self, j: int, sympy: Literal[True]) -> sp.Expr: ...
@@ -164,10 +164,11 @@ class Polynomial(FunctionSpace):
     def basis_function(self, j, sympy=False): ...
 
     def derivative_basis_function(self, j: int, k: int = 1) -> ABCPolyBase:
-        raise NotImplementedError
+        return self.basis_function(j).deriv(m=k)
 
     def mass_matrix(self) -> sparse.spmatrix:
-        raise NotImplementedError
+        m = self.L2_norm_sq(self.N + 1)
+        return sparse.diags([m], [0], (self.N + 1, self.N + 1), format="csr")
 
 
 class Legendre(Polynomial):
@@ -186,7 +187,7 @@ class Legendre(Polynomial):
         return Leg.basis(j)
 
     def L2_norm_sq(self, N: int) -> np.ndarray:
-        raise NotImplementedError
+        return 2 / (2 * np.arange(N) + 1)
 
     def eval(self, uh: np.ndarray, xj: np.ndarray | float) -> np.ndarray:
         xj = np.atleast_1d(xj)
@@ -213,10 +214,15 @@ class Chebyshev(Polynomial):
         return 1 / sp.sqrt(1 - x**2)
 
     def L2_norm_sq(self, N: int) -> np.ndarray:
-        raise NotImplementedError
+        m = np.zeros(N)
+        m[0] = np.pi
+        m[1:] = np.pi / 2
+        return m
 
     def eval(self, uh: np.ndarray, xj: np.ndarray | float) -> np.ndarray:
-        raise NotImplementedError
+        xj = np.atleast_1d(xj)
+        Xj = map_reference_domain(xj, self.domain, self.reference_domain)
+        return np.polynomial.chebyshev.chebval(Xj, uh)
 
     def inner_product(self, u: sp.Expr) -> np.ndarray:
         """Inner products (u, T_i), via the substitution x = cos(theta), integrating over
@@ -296,20 +302,32 @@ class Cosines(Trigonometric):
     def __init__(
         self, N: int, domain: Domain = (0, 1), bc: BC = (0, 0), constraint: int = 0
     ) -> None:
-        raise NotImplementedError
+        Trigonometric.__init__(self, N, domain=domain)
+        self.B = Neumann(bc, domain, self.reference_domain)
 
     @overload
     def basis_function(self, j: int, sympy: Literal[True]) -> sp.Expr: ...
     @overload
     def basis_function(self, j: int, sympy: Literal[False] = False) -> BasisCallable: ...
     def basis_function(self, j, sympy=False):
-        raise NotImplementedError
+        if sympy:
+            return sp.cos(j * sp.pi * x)
+        return lambda Xj: np.cos(j * np.pi * Xj)
 
     def derivative_basis_function(self, j: int, k: int = 1) -> BasisCallable:
-        raise NotImplementedError
+        mode = j
+        scale = (mode * np.pi) ** k
+        sign = (1, -1, -1, 1)[k % 4]
+        if k % 2 == 0:
+            return lambda Xj: sign * scale * np.cos(mode * np.pi * Xj)
+        else:
+            return lambda Xj: sign * scale * np.sin(mode * np.pi * Xj)
 
     def L2_norm_sq(self, N: int) -> np.ndarray:
-        raise NotImplementedError
+        norms = np.full(N, 0.5)
+        if N:
+            norms[0] = 1.0
+        return norms
 
 
 # Create classes to hold the boundary function
@@ -410,21 +428,32 @@ class DirichletLegendre(Composite, Legendre):
     @overload
     def basis_function(self, j: int, sympy: Literal[False] = False) -> Leg: ...
     def basis_function(self, j, sympy=False):
-        raise NotImplementedError
+        if sympy:
+            return sp.legendre(j, x) - sp.legendre(j + 2, x)
+        return Leg.basis(j) - Leg.basis(j + 2)
 
 
 class NeumannLegendre(Composite, Legendre):
     def __init__(
         self, N: int, domain: Domain = (-1, 1), bc: BC = (0, 0), constraint: int = 0
     ) -> None:
-        raise NotImplementedError
+        Legendre.__init__(self, N, domain=domain)
+        self.B = Neumann(bc, domain, self.reference_domain)
+        j = np.arange(N + 1, dtype=float)
+        coefficient = (j * (j+1)) / ((j + 2)*(j + 3)) 
+        self.S = sparse.diags((np.ones(N + 1), -coefficient),(0, 2),shape=(N + 1, N + 3),format="csr")
 
     @overload
     def basis_function(self, j: int, sympy: Literal[True]) -> sp.Expr: ...
     @overload
     def basis_function(self, j: int, sympy: Literal[False] = False) -> Leg: ...
     def basis_function(self, j, sympy=False):
-        raise NotImplementedError
+        if sympy:
+            j_sym = sp.sympify(j)
+            c = j_sym * (j_sym + 1) / ((j_sym + 2) * (j_sym + 3))
+            return sp.legendre(j_sym, x) - c * sp.legendre(j_sym + 2, x)
+        c = j * (j + 1) / ((j + 2) * (j + 3))
+        return Leg.basis(j) - c * Leg.basis(j + 2)
 
 
 class DirichletChebyshev(Composite, Chebyshev):
@@ -442,19 +471,26 @@ class DirichletChebyshev(Composite, Chebyshev):
             return sp.cos(j * sp.acos(x)) - sp.cos((j + 2) * sp.acos(x))
         return Cheb.basis(j) - Cheb.basis(j + 2)
 
-
 class NeumannChebyshev(Composite, Chebyshev):
     def __init__(
         self, N: int, domain: Domain = (-1, 1), bc: BC = (0, 0), constraint: int = 0
     ) -> None:
-        raise NotImplementedError
+        Chebyshev.__init__(self, N, domain=domain)
+        self.B = Neumann(bc, domain, self.reference_domain)
+        j = np.arange(N + 1, dtype=float)
+        coefficient = (j / (j + 2)) ** 2
+        self.S = sparse.diags((np.ones(N + 1), -coefficient),(0, 2),shape=(N + 1, N + 3),format="csr")
 
     @overload
     def basis_function(self, j: int | sp.Symbol, sympy: Literal[True]) -> sp.Expr: ...
     @overload
     def basis_function(self, j: int, sympy: Literal[False] = False) -> Cheb: ...
     def basis_function(self, j, sympy=False):
-        raise NotImplementedError
+        if sympy:
+            j_sym = sp.sympify(j)
+            coefficient = j_sym**2 / (j_sym + 2)**2
+            return (sp.chebyshevt(j_sym, x)- coefficient * sp.chebyshevt(j_sym + 2, x))
+        return Cheb.basis(j) - (j*j)/((j+2)**2) * Cheb.basis(j + 2)
 
 
 class BasisFunction:
